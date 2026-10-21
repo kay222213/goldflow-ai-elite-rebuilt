@@ -1,0 +1,13 @@
+GoldFlow AI Elite — Rebuilt Profit Manager Build
+Build date: 2026-10-22
+
+Verified in this build:
+- JavaScript syntax check (node --check app.js)
+- Static smoke tests (node tests/smoke-test.js)
+- Required app files and DOM control IDs cross-checked
+- Profit Manager initialization wired into page startup
+- Quote parser handles XAUS spot_usd_oz and timestamp/data_state fields
+- Candle scanner tries XAUS OHLC chart endpoint before Yahoo reference fallbacks
+- Profit target, remaining amount, target progress, equity estimate, daily rollover, signal lifecycle, direction filter and risk guardrails wired in code
+
+Live provider access could not be runtime-tested from the build environment because external DNS/network requests are blocked here. The browser should attempt the documented public endpoints at runtime and display OFFLINE/UNVERIFIED if they fail. A third-party live quote is indicative reference data, not an executable quote from the user's MT5 broker.

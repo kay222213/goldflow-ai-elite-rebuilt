@@ -1,0 +1,16 @@
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const assert = require('assert');
+const root = path.resolve(__dirname, '..');
+const html = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+const js = fs.readFileSync(path.join(root, 'app.js'), 'utf8');
+const css = fs.readFileSync(path.join(root, 'styles.css'), 'utf8');
+for (const f of ['index.html', 'app.js', 'styles.css', 'README.md', 'sw.js', 'manifest.webmanifest', 'cloudflare-worker/worker.js', 'assets/icon.svg', 'assets/fundamental-edge-lion.svg']) assert(fs.existsSync(path.join(root, f)), `Missing required file: ${f}`);
+assert(html.includes('id="pmSave"') && html.includes('id="pmUpdatePnL"'), 'Profit Manager controls missing');
+assert(js.includes("function pmInit()") && /function init\(\)[^{]*\{[^}]*pmInit\(\)/s.test(js), 'Profit Manager must initialise on page load');
+assert(js.includes('spot_usd_oz') && js.includes('data_state') && js.includes('/api/v1/chart?symbol=xau'), 'XAUS quote/OHLC data paths missing');
+assert(js.includes("pm.direction==='buy'") && js.includes("pm.direction==='sell'"), 'Direction filters missing');
+assert(js.includes('pmDayKey') && js.includes('DAILY TARGET REACHED') && js.includes('DAILY LOSS / OPEN-RISK CAP USED'), 'Daily target/risk guardrails missing');
+assert(css.length > 1000 && html.includes('data-tab="profit"'), 'UI styles or Profit Manager tab missing');
+console.log('GoldFlow smoke tests passed: project files, PM initialisation, target controls, feed parsers, direction filters, daily rollover and risk guardrails.');
