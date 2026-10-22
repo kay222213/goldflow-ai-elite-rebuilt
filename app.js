@@ -1,203 +1,98 @@
 (() => {
 'use strict';
 const $ = id => document.getElementById(id);
-const STORE='goldflow-elite-v4';
-const defaults={equity:2200,riskPct:1,maxDailyPct:3,currency:'ZAR',currencySymbol:'R',broker:'',contractSize:100,tickSize:.01,tickValue:'',refreshSeconds:15,dataUrl:'',checks:{},checklist:{},dailyPnl:0,openRisk:0};
-let cfg={...defaults}; let quote=null, quoteError='', quoteUpdatedAt=null, timer=null, candles=[], backtestRows=[], lastPlan=null;
-const fmt=(n,cur=cfg.currency)=>Number.isFinite(Number(n))?new Intl.NumberFormat('en-ZA',{style:'currency',currency:['ZAR','USD','EUR','GBP'].includes(cur)?cur:'ZAR',maximumFractionDigits:2}).format(Number(n)):'—';
-const num=(id)=>{const v=Number($(id).value);return Number.isFinite(v)?v:NaN};
-const setText=(id,v)=>{if($(id))$(id).textContent=v};
-const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-function load(){try{const s=JSON.parse(localStorage.getItem(STORE)||'{}');cfg={...defaults,...s,checks:s.checks||{},checklist:s.checklist||{}};}catch(e){cfg={...defaults};}}
-function save(){try{localStorage.setItem(STORE,JSON.stringify(cfg));}catch(e){}}
-function initFields(){ $('equityInput').value=cfg.equity;$('riskPct').value=cfg.riskPct;$('maxDailyPct').value=cfg.maxDailyPct;$('accountCurrency').value=cfg.currency;$('brokerName').value=cfg.broker;$('defaultContract').value=cfg.contractSize;$('defaultTick').value=cfg.tickSize;$('refreshSeconds').value=cfg.refreshSeconds;$('dataUrl').value=cfg.dataUrl;$('contractSize').value=cfg.contractSize;$('tickSize').value=cfg.tickSize;$('tickValue').value=cfg.tickValue;$('dailyPnl').value=cfg.dailyPnl;$('openRisk').value=cfg.openRisk;document.querySelectorAll('[data-check]').forEach(e=>e.checked=!!cfg.checklist[e.dataset.check]);}
-function updateAccount(){const eq=Math.max(0,Number(cfg.equity)||0),rp=Math.max(0,Number(cfg.riskPct)||0)/100,dp=Math.max(0,Number(cfg.maxDailyPct)||0)/100;setText('sideEquity',fmt(eq));setText('riskCash',fmt(eq*rp));setText('dailyCap',fmt(eq*dp));setText('riskEquity',fmt(eq));setText('riskDeskTrade',fmt(eq*rp));setText('riskDeskDaily',fmt(eq*dp));setText('currencyPrefix',cfg.currencySymbol||'R');}
-function showTab(tab){document.querySelectorAll('.tab-panel').forEach(p=>p.classList.toggle('active',p.id==='tab-'+tab));document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.tab===tab));const names={dashboard:'Trading dashboard',market:'Market intelligence',planner:'Trade planner',profit:'Profit Manager',risk:'Risk desk',backtest:'Candle backtester',settings:'Settings & data'};setText('pageTitle',names[tab]||'GoldFlow AI');if(tab==='profit')pmRender();}
-function clock(){const now=new Date();setText('clock',new Intl.DateTimeFormat('en-ZA',{timeZone:'Africa/Johannesburg',hour:'2-digit',minute:'2-digit',second:'2-digit',hour12:false}).format(now));setText('dateText',new Intl.DateTimeFormat('en-ZA',{timeZone:'Africa/Johannesburg',weekday:'short',day:'2-digit',month:'short',year:'numeric'}).format(now));const h=Number(new Intl.DateTimeFormat('en-US',{timeZone:'Africa/Johannesburg',hour:'2-digit',hour12:false}).format(now));const day=new Intl.DateTimeFormat('en-US',{timeZone:'Africa/Johannesburg',weekday:'short'}).format(now);let state='Outside main sessions';if(['Mon','Tue','Wed','Thu','Fri'].includes(day)&&h>=7&&h<17)state='London / overlap';else if(['Mon','Tue','Wed','Thu','Fri'].includes(day)&&h>=13&&h<23)state='New York hours';else if(h>=1&&h<10)state='Asia hours';setText('sessionState',state);setText('sessionDetail','Local time · '+day+' · '+String(h).padStart(2,'0')+':00 SAST');}
-function quoteTimestamp(q){let raw=q.price_as_of??q.data_state?.as_of??q.updated_at??q.updatedAt??q.timestamp??q.time??q.date??q.last_updated??q.lastUpdate;if(raw==null)return null;let d=typeof raw==='number'?(raw<1e12?new Date(raw*1000):new Date(raw)):new Date(raw);return Number.isNaN(d.getTime())?null:d;}
-function normalizeQuote(data,source){let price=Number(data?.spot_usd_oz??data?.xau?.price??data?.price??data?.last??data?.close??data?.bid??data?.rate??data?.gold);if(!Number.isFinite(price)||price<=0)throw new Error('Quote response has no valid positive price.');if(data?.data_state?.status==='unavailable')throw new Error('Provider reports price unavailable');const ts=quoteTimestamp(data);const age=Number(data?.data_state?.age_seconds);const timestampAge=ts?Math.max(0,(Date.now()-ts.getTime())/1000):NaN;const stale=data?.stale===true||data?.data_state?.status==='stale'||(Number.isFinite(timestampAge)&&timestampAge>180);if(data?.data_state?.status==='stale'&&Number.isFinite(age)&&age>180)throw new Error('Provider quote is stale ('+Math.round(age)+' seconds old)');return {price,source,sourceTime:ts,receivedAt:new Date(),raw:data,stale,ageSeconds:Number.isFinite(age)?age:(Number.isFinite(timestampAge)?Math.round(timestampAge):null)};}
-async function getJSON(url,timeout=6500){const ctrl=new AbortController();const t=setTimeout(()=>ctrl.abort(),timeout);try{const r=await fetch(url,{cache:'no-store',signal:ctrl.signal,headers:{'Accept':'application/json'}});if(!r.ok)throw new Error('HTTP '+r.status);return await r.json();}finally{clearTimeout(t);}}
-function setFeedState(ok,text){const led=$('sidebarLed');led.className='status-led '+(ok?'good':'bad');setText('sidebarStatus',text);setText('feedState',ok?'REFERENCE QUOTE':'UNVERIFIED');setText('feedDetail',text);setText('apiStatus',ok?'Connected':'Unavailable');$('apiStatus').className='pill '+(ok?'':'bad');}
-async function refreshQuote(){
-  setText('feedBadge','UPDATING');$('feedBadge').className='pill warn';
-  let fresh=null;const failures=[];
-  if(cfg.dataUrl){
-    try{
-      const base=cfg.dataUrl.replace(/\/+$/,'');
-      const d=await getJSON(base.endsWith('/quote')?base:base+'/quote',7000);
-      const candidate=normalizeQuote(d,d.source||'Configured market-data proxy');
-      if(candidate.stale)throw new Error('Configured provider returned a stale quote');
-      fresh=candidate;
-    }catch(e){failures.push((e?.message||String(e))+' (configured proxy)');}
-  }
-  if(!fresh){
-    const sources=[
-      {url:'https://xaus.com/api/v1/spot?compact=1&fresh='+Date.now(),name:'XAUS XAU/USD spot'},
-      {url:'https://api.gold-api.com/price/XAU',name:'Gold-API XAU spot'},
-      {url:'https://api.metals.live/v1/spot/gold',name:'Metals.live spot'},
-      {url:'https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?range=1d&interval=1m',name:'Yahoo XAU/USD reference',kind:'yahoo'},
-      {url:'https://query2.finance.yahoo.com/v8/finance/chart/GC=F?range=1d&interval=1m',name:'Yahoo gold futures reference',kind:'yahoo'}
-    ];
-    for(const src of sources){
-      try{
-        const d=await getJSON(src.url,7000);let candidate;
-        if(src.kind==='yahoo'){
-          const r=d?.chart?.result?.[0],q=r?.indicators?.quote?.[0],ts=r?.timestamp||[];
-          let i=ts.length-1;while(i>=0&&!Number.isFinite(Number(q?.close?.[i])))i--;
-          const price=Number(q?.close?.[i]??r?.meta?.regularMarketPrice);
-          if(!(price>0))throw new Error('No valid latest price');
-          const sourceTime=ts[i]?new Date(ts[i]*1000):null;
-          const stale=!!sourceTime&&(Date.now()-sourceTime.getTime()>180000);
-          candidate={price,source:src.name,sourceTime,receivedAt:new Date(),raw:d,stale};
-        }else{
-          const v=Array.isArray(d)?d[0]:d;
-          if(Array.isArray(v)&&v.length>=2){candidate=normalizeQuote({price:v[1],timestamp:v[0]},src.name);}
-          else candidate=normalizeQuote(v,src.name);
-        }
-        if(candidate.stale)throw new Error('Source returned a stale quote');
-        fresh=candidate;break;
-      }catch(e){failures.push((e?.message||String(e))+' ('+src.name+')');}
-    }
-  }
-  if(fresh){
-    quote=fresh;quoteUpdatedAt=fresh.sourceTime||fresh.receivedAt;quoteError='';
-    setFeedState(true,fresh.source);
-    $('feedBadge').textContent=fresh.sourceTime?'CONNECTED · REFERENCE QUOTE':'RECEIVED · TIME UNVERIFIED';
-    $('feedBadge').className='pill '+(fresh.sourceTime?'':'warn');
-    const display=fresh.price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:3});
-    setText('goldPrice',display);setText('marketPrice',display);setText('goldSource',fresh.source);
-    setText('marketQuoteMeta',fresh.sourceTime?'Source time: '+fresh.sourceTime.toLocaleString():'Source timestamp unavailable');
-    setText('goldUpdated',fresh.sourceTime?fresh.sourceTime.toLocaleTimeString('en-ZA')+' source':'received '+fresh.receivedAt.toLocaleTimeString('en-ZA'));
-    setText('marketAge',fresh.sourceTime?ageText(fresh.sourceTime):'Unknown');
-    setText('qualityValue',fresh.sourceTime?'TIMESTAMPED':'TIME UNVERIFIED');
-    setText('qualityDetail',fresh.sourceTime?'Timestamped third-party reference quote; compare with broker':'No source timestamp; do not treat as verified real-time');
-    setText('goldChange','Reference price · not broker bid/ask');setText('biasValue','NO TRADE');setText('biasSub','Quote alone does not establish directional edge');
-    $('globalNotice').classList.remove('hidden');
-    $('globalNotice').textContent='REFERENCE DATA CONNECTED ('+fresh.source+'). This is not your broker executable bid/ask; compare price, spread and timestamp with MT5 before trading.';
-    renderEvidence('Reference price received from '+fresh.source+'. Directional bias remains unconfirmed because price alone is not sufficient evidence.');
-  }else{
-    quote=null;quoteError=failures.slice(-3).join(' · ')||'No public quote source responded';
-    setFeedState(false,'No current quote · '+quoteError);$('feedBadge').textContent='OFFLINE / UNVERIFIED';$('feedBadge').className='pill bad';
-    setText('goldSource','Not connected');setText('goldUpdated','—');setText('marketQuoteMeta','No verified quote · '+quoteError);setText('marketAge','—');
-    setText('qualityValue','UNVERIFIED');setText('qualityDetail','All configured/public quote routes failed or returned stale data');setText('goldChange','No current quote');setText('biasValue','NO TRADE');setText('biasSub','Insufficient verified evidence');
-    $('globalNotice').classList.remove('hidden');$('globalNotice').textContent='LIVE REFERENCE DATA UNAVAILABLE: all attempted sources failed or returned stale data. No price has been invented. Do not use a stale price for execution.';
-    renderEvidence('Quote fetch failed: '+quoteError+'. Do not infer a trade direction.');
-  }
+let candles = [], quote = null, lastAnalysis = null;
+const money = (n, currency = $('currency')?.value || 'USD') => Number.isFinite(n) ? new Intl.NumberFormat('en-ZA',{style:'currency',currency,maximumFractionDigits:2}).format(n) : '—';
+const num = (id, fallback=0) => { const v=Number($(id).value); return Number.isFinite(v)?v:fallback; };
+const fmt = n => Number.isFinite(n) ? n.toLocaleString('en-US',{maximumFractionDigits:2}) : '—';
+function switchTab(id){document.querySelectorAll('.view').forEach(v=>v.classList.toggle('active',v.id===id));document.querySelectorAll('.tab').forEach(b=>b.classList.toggle('active',b.dataset.tab===id));}
+document.querySelectorAll('.tab').forEach(b=>b.addEventListener('click',()=>switchTab(b.dataset.tab)));
+function parseCSV(text){
+ const lines=text.trim().split(/\r?\n/).filter(Boolean); if(lines.length<2) throw Error('CSV needs a header and at least one data row.');
+ const split=line=>line.split(',').map(s=>s.trim().replace(/^"|"$/g,''));
+ const headers=split(lines[0]).map(x=>x.toLowerCase());
+ const idx=name=>headers.findIndex(h=>h===name || (name==='time'&&['timestamp','datetime','date'].includes(h)));
+ const oi=idx('open'),hi=idx('high'),li=idx('low'),ci=idx('close'),ti=idx('time'),vi=idx('volume');
+ if([oi,hi,li,ci].some(i=>i<0)) throw Error('CSV must include open, high, low and close columns.');
+ const out=[];
+ for(let r=1;r<lines.length;r++){const a=split(lines[r]);const c={time:ti>=0?(a[ti]||''):String(r),open:Number(a[oi]),high:Number(a[hi]),low:Number(a[li]),close:Number(a[ci]),volume:vi>=0?Number(a[vi])||0:0};
+ if(![c.open,c.high,c.low,c.close].every(Number.isFinite)||c.high<Math.max(c.open,c.close)||c.low>Math.min(c.open,c.close)||c.high<c.low) continue;out.push(c);}
+ if(out.length<2) throw Error('No valid OHLC rows found. Check CSV columns and values.');
+ return out;
 }
-function ageText(d){let secs=Math.max(0,Math.floor((Date.now()-d.getTime())/1000));if(secs<60)return secs+'s old';if(secs<3600)return Math.floor(secs/60)+'m '+secs%60+'s old';return Math.floor(secs/3600)+'h old';}
-function renderEvidence(message){$('evidenceLog').innerHTML='<div class="log-row"><span class="status-led '+(quote?'good':'bad')+'"></span><span>'+esc(message)+'</span></div><div class="log-row"><span class="status-led"></span><span>Macro, DXY/yields, session liquidity and M5 structure must be checked independently.</span></div>';}
-function saveAccount(){const e=num('equityInput'),r=num('riskPct'),d=num('maxDailyPct');if(!(e>=0)||!(r>0&&r<=5)||!(d>0&&d<=20)){alert('Enter equity ≥ 0, risk per trade between 0.1–5%, and daily limit between 0.1–20%.');return;}cfg.equity=e;cfg.riskPct=r;cfg.maxDailyPct=d;save();updateAccount();calcPlan(false);}
-function planCalc(showMessage=true){const dir=$('direction').value,entry=num('entry'),stop=num('stop'),target=num('target'),contract=num('contractSize'),tickVal=num('tickValue'),tickSize=num('tickSize'),eq=Number(cfg.equity)||0,risk=eq*(Number(cfg.riskPct)||0)/100;const warnings=[];if(![entry,stop,target].every(Number.isFinite)||entry<=0||stop<=0||target<=0){if(showMessage)setText('planStatus','Enter valid trade levels');$('planWarnings').className='warning-list';$('planWarnings').textContent='Entry, stop and target must be positive numbers.';return null;}const stopDist=Math.abs(entry-stop),targetDist=Math.abs(target-entry);const valid=dir==='buy'?(stop<entry&&target>entry):(stop>entry&&target<entry);if(!valid)warnings.push('INVALID TRADE GEOMETRY: stop and target must be on the correct side of entry.');if(stopDist===0)warnings.push('Stop distance cannot be zero.');let cashPerPriceLot;if(Number.isFinite(tickVal)&&tickVal>0&&Number.isFinite(tickSize)&&tickSize>0)cashPerPriceLot=tickVal/tickSize;else if(contract>0)cashPerPriceLot=contract;else cashPerPriceLot=NaN;const lots=(valid&&stopDist>0&&cashPerPriceLot>0)?risk/(stopDist*cashPerPriceLot):NaN;const profit=Number.isFinite(lots)?targetDist*cashPerPriceLot*lots:NaN;const rr=stopDist>0?targetDist/stopDist:NaN;if(!Number.isFinite(tickVal)||tickVal<=0)warnings.push('ESTIMATE: tick value is not configured. Assumes contract size × price move in account currency; FX conversion, broker contract details, commissions and slippage are excluded.');if(eq<=0)warnings.push('Equity is zero or invalid; position size is zero / unavailable.');if(Number.isFinite(lots)&&lots>0)warnings.push('Round DOWN to your broker volume step and confirm minimum/maximum lot size.');if(Number.isFinite(lots)&&lots>0.01)warnings.push('Lot estimate is not adjusted for broker lot step, leverage, margin, spread or slippage.');if(rr<1)warnings.push('Reward-to-risk is below 1:1; review the setup.');lastPlan={dir,entry,stop,target,stopDist,targetDist,rr,risk,lots,profit,valid,warnings,cashPerPriceLot};setText('planStatus',valid?'Plan calculated — verify specifications':'NO TRADE — invalid levels');setText('stopDistance',stopDist.toFixed(2));setText('targetDistance',targetDist.toFixed(2));setText('rrValue',Number.isFinite(rr)?rr.toFixed(2)+' : 1':'—');setText('riskAmountPlan',fmt(risk));setText('lotResult',Number.isFinite(lots)?lots.toFixed(4)+' lots':'—');setText('profitResult',Number.isFinite(profit)?fmt(profit):'—');$('planWarnings').className='warning-list '+(valid?'':'bad');$('planWarnings').innerHTML=warnings.length?warningsToHTML(warnings):'Geometry valid. Confirm quote, tick value, broker volume step, spread, margin and event risk before execution.';setText('positionSize',Number.isFinite(lots)?lots.toFixed(4)+' lots':'— lots');return lastPlan;}
-function warningsToHTML(w){return w.map(x=>'• '+esc(x)).join('<br>');}
-function calcPlan(show=true){return planCalc(show);}
-function updateStructure(){const ids=['ctxH4','ctxPD','ctxSweep','ctxM5','ctxNews'];const n=ids.filter(id=>$(id).checked).length;setText('structureStatus',n===5?'CHECKLIST COMPLETE — STILL VERIFY LIVE':'NO TRADE — NOT CONFIRMED');setText('structureDetail',n+' of 5 checks completed. This is not a probability score or a generated signal.');}
-function updateRisk(){cfg.dailyPnl=num('dailyPnl')||0;cfg.openRisk=Math.max(0,num('openRisk')||0);save();const cap=(Number(cfg.equity)||0)*(Number(cfg.maxDailyPct)||0)/100;const loss=Math.max(0,-cfg.dailyPnl),remaining=cap-loss-cfg.openRisk;const box=$('riskStatus');box.className='decision-box';if(loss>=cap||remaining<=0){box.style.borderColor='#7c2b36';box.innerHTML='<strong style="color:var(--red)">LIMIT REACHED / EXCEEDED</strong><p>Loss counted: '+esc(fmt(loss))+' · Open risk: '+esc(fmt(cfg.openRisk))+' · Daily cap: '+esc(fmt(cap))+'. Stop and review your rules; app cannot block broker orders.</p>';}else{box.innerHTML='<strong>WITHIN CONFIGURED LIMIT</strong><p>Remaining loss budget after open risk: '+esc(fmt(remaining))+'. This manual tracker may not include floating P/L, fees or broker account changes.</p>';}}
-function parseCSV(text){const lines=text.replace(/^\uFEFF/,'').trim().split(/\r?\n/).filter(Boolean);if(lines.length<3)throw new Error('CSV must contain a header and at least two candles.');const parseLine=l=>{const out=[];let v='',q=false;for(let i=0;i<l.length;i++){const c=l[i];if(c==='"'){if(q&&l[i+1]==='"'){v+='"';i++;}else q=!q;}else if(c===','&&!q){out.push(v.trim());v='';}else v+=c;}out.push(v.trim());return out;};const head=parseLine(lines[0]).map(x=>x.toLowerCase().trim());const ix={time:head.findIndex(x=>['time','date','datetime','timestamp'].includes(x)),open:head.indexOf('open'),high:head.indexOf('high'),low:head.indexOf('low'),close:head.indexOf('close')};if(['open','high','low','close'].some(k=>ix[k]<0))throw new Error('CSV needs open, high, low, close columns.');return lines.slice(1).map((line,i)=>{const a=parseLine(line),c={time:ix.time>=0?a[ix.time]:String(i+1),open:Number(a[ix.open]),high:Number(a[ix.high]),low:Number(a[ix.low]),close:Number(a[ix.close])};if(![c.open,c.high,c.low,c.close].every(Number.isFinite)||c.open<=0||c.close<=0||c.high<Math.max(c.open,c.close)||c.low>Math.min(c.open,c.close))throw new Error('Invalid OHLC candle at data row '+(i+2));return c;});}
-function sma(arr,end,period){if(end+1<period)return NaN;let s=0;for(let i=end-period+1;i<=end;i++)s+=arr[i];return s/period;}
-function runBacktest(){if(candles.length<10){setText('btMessage','Import a valid OHLC CSV first.');return;}const fast=Math.floor(num('fastPeriod')),slow=Math.floor(num('slowPeriod')),riskPct=num('backtestRisk')/100,costBps=num('feeBps')/10000;if(!(fast>=2&&slow>fast&&slow<candles.length)){setText('btMessage','Slow SMA must be greater than fast SMA and less than candle count.');return;}let side=0,entry=0,entryTime='',equity=1,peak=1,maxDD=0,wins=0,grossWin=0,grossLoss=0;const trades=[];const closes=candles.map(c=>c.close);for(let i=1;i<candles.length;i++){const f0=sma(closes,i-1,fast),s0=sma(closes,i-1,slow),f1=sma(closes,i,fast),s1=sma(closes,i,slow);if(![f0,s0,f1,s1].every(Number.isFinite))continue;const sig=f0<=s0&&f1>s1?1:(f0>=s0&&f1<s1?-1:0);if(sig&&side&&sig!==side){const px=candles[i].close;const raw=side*(px-entry)/entry;const net=raw*riskPct*100-costBps*100;equity*=1+net/100;trades.push({entryTime,side:side===1?'BUY':'SELL',entry,exitTime:candles[i].time,exit:px,net});if(net>0){wins++;grossWin+=net;}else grossLoss+=Math.abs(net);peak=Math.max(peak,equity);maxDD=Math.max(maxDD,(peak-equity)/peak*100);side=0;}if(sig&&!side){side=sig;entry=candles[i].close;entryTime=candles[i].time;}}if(side){const c=candles[candles.length-1],raw=side*(c.close-entry)/entry;const net=raw*riskPct*100-costBps*100;equity*=1+net/100;trades.push({entryTime,side:side===1?'BUY':'SELL',entry,exitTime:c.time,exit:c.close,net});if(net>0){wins++;grossWin+=net;}else grossLoss+=Math.abs(net);peak=Math.max(peak,equity);maxDD=Math.max(maxDD,(peak-equity)/peak*100);}backtestRows=trades;const net=(equity-1)*100;setText('btTrades',trades.length);setText('btWinRate',trades.length?(wins/trades.length*100).toFixed(1)+'%':'—');setText('btReturn',net.toFixed(2)+'%');setText('btDrawdown',maxDD.toFixed(2)+'%');setText('btPF',grossLoss? (grossWin/grossLoss).toFixed(2):grossWin?'∞':'—');setText('btExpectancy',trades.length?(trades.reduce((s,t)=>s+t.net,0)/trades.length).toFixed(3)+'%':'—');setText('btMessage','Test complete on '+candles.length+' candles. SMA crossover is a demonstration strategy; no slippage model beyond the configured flat cost, no intrabar fills, and no out-of-sample validation.');$('btMessage').className='warning-list';$('btLog').innerHTML=trades.length?trades.slice(-100).reverse().map((t,i)=>'<tr><td>'+(trades.length-i)+'</td><td>'+esc(t.entryTime)+'</td><td>'+t.side+'</td><td>'+t.entry+'</td><td>'+esc(t.exitTime)+'</td><td>'+t.exit+'</td><td style="color:'+(t.net>=0?'var(--green)':'var(--red)')+'">'+t.net.toFixed(3)+'%</td></tr>').join(''):'<tr><td colspan="7">No completed trades for these settings.</td></tr>';}
-async function loadCSV(file){try{candles=parseCSV(await file.text());setText('fileStatus',candles.length+' valid candles loaded.');}catch(e){candles=[];setText('fileStatus','CSV error: '+e.message);}}
-
-const PMKEY='goldflow_profit_manager_v1';
-let pm={equity:1000,target:100,direction:'both',risk:1,maxLoss:3,minRR:2,realised:0,openRisk:0,signals:[],active:null};
-let pmCandles=[],pmLastScan=0,pmDataSource='Not connected',pmScanBusy=false;
-function pmLoad(){try{pm={...pm,...JSON.parse(localStorage.getItem(PMKEY)||'{}')};}catch(e){};}
-function pmSave(){const eq=Number($('pmEquity').value),target=Number($('pmTarget').value),risk=Number($('pmRisk').value),loss=Number($('pmMaxLoss').value),rr=Number($('pmMinRR').value);if(!(eq>0)||!(target>0)||!(risk>=.1&&risk<=2)||!(loss>=.1&&loss<=5)||!(rr>=1&&rr<=5)){alert('Check inputs: equity and target must be above zero; risk 0.1–2%; daily loss cap 0.1–5%; minimum R:R 1–5.');return;}pm.equity=eq;pm.target=target;pm.direction=$('pmDirection').value;pm.risk=risk;pm.maxLoss=loss;pm.minRR=rr;pmRollDay();pmPersist();pmRender();pmRescan();}
-function pmFields(){if(!$('pmEquity'))return;$('pmEquity').value=pm.equity;$('pmTarget').value=pm.target;$('pmDirection').value=pm.direction;$('pmRisk').value=pm.risk;$('pmMaxLoss').value=pm.maxLoss;$('pmMinRR').value=pm.minRR;$('pmRealised').value=pm.realised;$('pmOpenRisk').value=pm.openRisk;}
-function pmRender(){
- if(!$('pmTargetState'))return;
- pmRollDay();
- const target=Math.max(0,Number(pm.target)||0),eq=Math.max(0,Number(pm.equity)||0),need=Math.max(0,target-(Number(pm.realised)||0)),pct=eq>0?target/eq*100:NaN,risk=eq*(Number(pm.risk)||0)/100,cap=eq*(Number(pm.maxLoss)||0)/100,loss=Math.max(0,-(Number(pm.realised)||0)),remainingLoss=cap-loss-(Number(pm.openRisk)||0);
- setText('pmTargetDisplay',fmt(target));setText('pmRemaining',fmt(need));setText('pmRequiredPct',Number.isFinite(pct)?pct.toFixed(2)+'%':'—');setText('pmRiskCash',fmt(risk));setText('pmTargetState',target>0?(need<=0?'DAILY TARGET REACHED':'TARGET IN PROGRESS'):'Enter a positive target');$('pmProgressBar').style.width=(target>0?Math.max(0,Math.min(100,(Number(pm.realised)||0)/target*100)):0)+'%';setText('pmProgressText','Target progress: '+(target>0?((Number(pm.realised)||0)/target*100).toFixed(1):'0.0')+'% · Today ('+pm.dayKey+') realised P/L: '+fmt(Number(pm.realised)||0)+' · Current equity estimate: '+fmt(eq+(Number(pm.realised)||0))+' · Floating P/L is excluded.');
- let guard='Risk per trade: '+fmt(risk)+' · Daily loss cap: '+fmt(cap)+'. ';if(target>0&&need<=0)guard+=' DAILY PROFIT TARGET REACHED: scanner remains visible, but stop initiating new trades for the day. ';if(remainingLoss<=0)guard+='DAILY LOSS BUDGET USED: stop and review; the app cannot block broker orders.';else guard+='Remaining loss budget after open risk: '+fmt(remainingLoss)+'.';if(pct>10)guard+=' Target requires '+pct.toFixed(1)+'% return on current equity; this is exceptionally aggressive and is not a forecast.';setText('pmGuardrail',guard);
- if(!pmLastScan&&!pmScanBusy){setText('pmEngineStatus',quote?'REFERENCE QUOTE AVAILABLE · CANDLES NOT CONNECTED':'WAITING FOR MARKET DATA');setText('pmScanStatus',quote?'Reference quote available; press Refresh scan to connect the live candle source.':'No market quote currently available; scan is waiting.');}
- setText('pmSignalCount',pm.signals.length+' signals');const list=$('pmSignalList');
- list.innerHTML=pm.signals.length?pm.signals.slice().reverse().map(sig=>{const active=['TAKEN','HOLD','CLOSE NOW'].includes(sig.status);return `<article class="pm-signal ${sig.status==='NEW SIGNAL'?'pm-new-flash':''}"><div class="pm-signal-top"><div><strong>${esc(sig.side)} · ${esc(sig.type)}</strong><div class="tiny muted">${esc(sig.time)} · ${esc(sig.id)}</div></div><span class="pill neutral">${esc(sig.status)}</span></div><p>${esc(sig.summary||'Signal candidate')}</p><div class="metric-grid"><div class="metric"><span class="tiny muted">ENTRY</span><strong>${Number.isFinite(sig.entry)?Number(sig.entry).toFixed(2):'—'}</strong></div><div class="metric"><span class="tiny muted">STOP</span><strong>${Number.isFinite(sig.stop)?Number(sig.stop).toFixed(2):'—'}</strong></div><div class="metric"><span class="tiny muted">TARGET</span><strong>${Number.isFinite(sig.target)?Number(sig.target).toFixed(2):'—'}</strong></div></div><div class="pm-actions">${sig.status==='NEW SIGNAL'?`<button class="primary-btn" data-pm-action="take" data-id="${esc(sig.id)}">TAKE</button><button class="secondary-btn" data-pm-action="skip" data-id="${esc(sig.id)}">SKIP</button>`:''}${active?`<button class="secondary-btn" data-pm-action="hold" data-id="${esc(sig.id)}">HOLD</button><button class="danger-btn" data-pm-action="close" data-id="${esc(sig.id)}">CLOSE NOW</button>`:''}<button class="secondary-btn" data-pm-detail="${esc(sig.id)}">Expand details</button></div><details class="pm-expanded"><summary>Full signal details & lifecycle</summary><p><b>Lifecycle:</b> ${esc((sig.lifecycle||[]).map(x=>x.status+' — '+x.time).join(' → ')||sig.status)}</p><p><b>Evidence:</b> ${esc(sig.summary||'No extra evidence recorded.')}</p><p><b>Reminder:</b> Take/Skip is your decision only. This dashboard does not send broker orders or automatically close positions.</p></details></article>`}).join(''):'<div class="empty-state">No confirmed signals yet. The app will not invent BUY/SELL entries from a price quote alone.</div>';
- const hist=$('pmHistory');hist.innerHTML=pm.signals.length?pm.signals.slice().reverse().map(sig=>`<tr><td>${esc(sig.time)}</td><td>${esc(sig.type)}</td><td>${esc(sig.side)}</td><td>${Number.isFinite(sig.entry)?sig.entry:'—'}</td><td>${esc(sig.status)}</td><td>${esc(sig.outcome||'—')}</td></tr>`).join(''):'<tr><td colspan="6" class="muted">No signals logged in this browser yet.</td></tr>';
- list.querySelectorAll('[data-pm-detail]').forEach(b=>b.addEventListener('click',()=>pmDetails(b.dataset.pmDetail)));
- list.querySelectorAll('[data-pm-action]').forEach(b=>b.addEventListener('click',()=>pmAction(b.dataset.id,b.dataset.pmAction)));
+function renderCandles(){const body=$('candleRows');if(!candles.length){body.innerHTML='<tr><td colspan="6" class="muted">No candles loaded</td></tr>';return;}body.innerHTML=candles.slice(-12).reverse().map(c=>`<tr><td>${esc(c.time)}</td><td>${fmt(c.open)}</td><td>${fmt(c.high)}</td><td>${fmt(c.low)}</td><td>${fmt(c.close)}</td><td>${fmt(c.volume)}</td></tr>`).join('');}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function atrCalc(cs,period=14){if(cs.length<2)return NaN;let trs=[];for(let i=1;i<cs.length;i++){const c=cs[i],p=cs[i-1];trs.push(Math.max(c.high-c.low,Math.abs(c.high-p.close),Math.abs(c.low-p.close)));}return trs.slice(-period).reduce((a,b)=>a+b,0)/Math.min(period,trs.length);}
+function analyze(){
+ const n=candles.length;
+ if(!n){$('marketState').textContent='NO TRADE · DATA REQUIRED';$('signalState').textContent='NO TRADE';$('signalExplanation').textContent='Import candles before analysis. No signal is manufactured.';$('buyScore').textContent=$('sellScore').textContent='—';$('buyReason').textContent=$('sellReason').textContent='Need candle data';$('structure').textContent='Unavailable';$('swingHigh').textContent=$('swingLow').textContent=$('atr').textContent='—';$('sweep').textContent='—';$('tradePlan').textContent='No qualified setup. Load candle data and review the conditions before considering a trade.';return;}
+ const cs=candles, last=cs[n-1], a=atrCalc(cs), range=cs.slice(Math.max(0,n-21),n-1);
+ const sh=Math.max(...range.map(c=>c.high)),sl=Math.min(...range.map(c=>c.low));
+ const bullish=last.close>last.open,bearish=last.close<last.open;
+ const upBreak=last.close>sh,downBreak=last.close<sl;
+ const sweepHigh=last.high>sh&&last.close<sh,sweepLow=last.low<sl&&last.close>sl;
+ const body=Math.abs(last.close-last.open), displacement=Number.isFinite(a)&&body>=a*.7;
+ const buy= (upBreak?2:0)+(bullish?1:0)+(displacement?1:0)+(sweepLow?1:0);
+ const sell=(downBreak?2:0)+(bearish?1:0)+(displacement?1:0)+(sweepHigh?1:0);
+ $('latestPrice').textContent=quote?`${fmt(quote.price)}*`:fmt(last.close);
+ $('latestTime').textContent=quote?`${quote.time} (manual)`:String(last.time||'Imported candle');
+ $('structure').textContent=upBreak?'Bullish break (candle proxy)':downBreak?'Bearish break (candle proxy)':bullish?'Bullish candle, no confirmed break':bearish?'Bearish candle, no confirmed break':'Neutral';
+ $('swingHigh').textContent=fmt(sh);$('swingLow').textContent=fmt(sl);$('sweep').textContent=sweepHigh?'Possible high sweep':sweepLow?'Possible low sweep':'No sweep detected';$('atr').textContent=fmt(a);
+ $('buyScore').textContent=`${buy}/5`; $('sellScore').textContent=`${sell}/5`;
+ $('buyReason').textContent=upBreak?'Close broke prior 20-candle high':sweepLow?'Low swept then reclaimed':bullish?'Bullish candle only':'No bullish confirmation';
+ $('sellReason').textContent=downBreak?'Close broke prior 20-candle low':sweepHigh?'High swept then rejected':bearish?'Bearish candle only':'No bearish confirmation';
+ const minRR=num('minRR',2), mult=num('atrMult',1.5);
+ let dir=null,entry=last.close,stop,tp1,tp2,reason='';
+ if(n>=22&&Number.isFinite(a)&&a>0&&buy>=4&&buy>sell){dir='BUY';stop=entry-a*mult;tp1=entry+a*mult*minRR;tp2=entry+a*mult*(minRR+1);reason='Bullish close beyond prior 20-candle range with supporting candle momentum.';}
+ else if(n>=22&&Number.isFinite(a)&&a>0&&sell>=4&&sell>buy){dir='SELL';stop=entry+a*mult;tp1=entry-a*mult*minRR;tp2=entry-a*mult*(minRR+1);reason='Bearish close beyond prior 20-candle range with supporting candle momentum.';}
+ const qualified=!!dir;
+ $('marketState').textContent=qualified?'TRADE SETUP · CANDLE PROXY':'WAIT · NO QUALIFIED SETUP';
+ $('signalState').textContent=qualified?`${dir} CANDIDATE`:'WAIT / NO TRADE';
+ $('signalExplanation').textContent=qualified?`${reason} Confidence score ${Math.max(buy,sell)}/5 is a rule score, not win probability.`:'Rules not satisfied or fewer than 22 candles. A no-trade result is valid.';
+ $('tradePlan').innerHTML=qualified?`<div class="metric-list"><div><span>Direction / type</span><b>${dir} · range breakout proxy</b></div><div><span>Entry reference</span><b>${fmt(entry)}</b></div><div><span>Stop-loss</span><b>${fmt(stop)}</b></div><div><span>Target 1</span><b>${fmt(tp1)}</b></div><div><span>Target 2</span><b>${fmt(tp2)}</b></div><div><span>Reward:risk</span><b>${minRR.toFixed(1)}:1 minimum target</b></div><div><span>Invalidation</span><b>Close beyond stop / setup expires on new structure</b></div></div><p class="note">Candidate only. Confirm spread, session, macro events and opposing liquidity. No true bid/ask order-flow evidence is present.</p>`:'No qualified setup. The rule score is not a probability. Check candle quality and use WAIT/NO TRADE if evidence is insufficient.';
+ lastAnalysis={a,sh,sl,buy,sell,dir,entry,stop,tp1,tp2};
 }
-function pmAction(id,action){pmRollDay();const sig=pm.signals.find(x=>x.id===id);if(!sig)return;if(action==='take'){const active=pm.signals.find(s=>s.id!==sig.id&&['TAKEN','HOLD'].includes(s.status));if(active){alert('Exposure guard: close or finish the currently tracked trade before taking another signal.');return;}const cap=Math.max(0,pm.equity)*(Number(pm.maxLoss)||3)/100;if(Math.max(0,-(Number(pm.realised)||0))+Math.max(0,Number(pm.openRisk)||0)>=cap){alert('Daily loss/open-risk guardrail reached. Do not take another trade today.');return;}if((Number(pm.realised)||0)>=Number(pm.target||Infinity)){alert('Daily target reached. Stop initiating new trades today.');return;}}const stamp=()=>new Date().toLocaleString('en-ZA');sig.lifecycle=sig.lifecycle||[];const set=(status,note)=>{sig.status=status;sig.updatedAt=stamp();sig.lifecycle.push({status,time:sig.updatedAt,note:note||''});};
- if(action==='take'){set('TAKEN','User confirmed they entered this setup.');pm.active=sig.id;}else if(action==='skip'){set('SKIPPED','User chose not to enter.');if(pm.active===sig.id)pm.active=null;}else if(action==='hold'){if(sig.status!=='TAKEN'&&sig.status!=='HOLD'){alert('Choose TAKE first.');return;}set('HOLD','User elects to keep monitoring.');}else if(action==='close'){if(!['TAKEN','HOLD'].includes(sig.status)){alert('Choose TAKE before closing a tracked signal.');return;}const outcome=prompt('Position closed manually. Enter realised P/L in ZAR (use a minus sign for a loss), or leave blank to record no P/L yet.','');set('CLOSED','User marked the position closed.');if(outcome!==null&&outcome.trim()!==''&&Number.isFinite(Number(outcome))){sig.realisedZAR=Number(outcome);sig.outcome=Number(outcome)>0?'WIN':Number(outcome)<0?'LOSS':'BREAKEVEN';pm.realised=(Number(pm.realised)||0)+Number(outcome);if($('pmRealised'))$('pmRealised').value=pm.realised;}if(pm.active===sig.id)pm.active=null;}
- pmPersist();pmRender();}
-function pmDetails(id){const sig=pm.signals.find(x=>x.id===id);if(!sig)return;const lines=['SIGNAL: '+sig.side+' / '+sig.type,'Created: '+sig.time,'Entry: '+(Number.isFinite(sig.entry)?sig.entry:'not set'),'Stop: '+(Number.isFinite(sig.stop)?sig.stop:'not set'),'Target: '+(Number.isFinite(sig.target)?sig.target:'not set'),'Status: '+sig.status,'Outcome: '+(sig.outcome||'not recorded'),'Evidence: '+(sig.summary||'none'),'Lifecycle:',...(sig.lifecycle||[]).map(x=>x.status+' — '+x.time+(x.note?' — '+x.note:''))];alert(lines.join('\n'));}
-async function fetchGoldCandles(){
-  let lastErr='No candle source responded';
-  // Preferred path: user's secure Cloudflare Worker proxy. This uses authenticated OHLC data.
-  if(cfg.dataUrl){
-    try{
-      const base=cfg.dataUrl.replace(/\/+$/,'').replace(/\/quote$/,'');
-      const d=await getJSON(base+'/candles?interval=5min&outputsize=500',12000);
-      if(d.error)throw new Error(d.error);
-      const values=Array.isArray(d.values)?d.values:[];
-      const rows=values.map(c=>({time:new Date(c.datetime.endsWith('Z')?c.datetime:c.datetime.replace(' ','T')+'Z'),open:Number(c.open),high:Number(c.high),low:Number(c.low),close:Number(c.close),volume:Number(c.volume)||0})).filter(c=>[c.open,c.high,c.low,c.close].every(v=>Number.isFinite(v)&&v>0));
-      if(rows.length<60)throw new Error('Configured provider returned fewer than 60 valid candles');
-      pmDataSource=(d.source||'Configured authenticated provider')+' XAU/USD OHLC';
-      return {rows,meta:{regularMarketPrice:rows.at(-1).close},symbol:'XAU/USD'};
-    }catch(e){lastErr=e.message||String(e);}
-  }
-  // First choice: XAUS's public OHLC endpoint. It returns real source OHLC bars and supports browser CORS.
-  try{
-    const d=await getJSON('https://xaus.com/api/v1/chart?symbol=xau&range=5d&interval=5m&fresh='+Date.now(),10000);
-    const points=Array.isArray(d.points)?d.points:(Array.isArray(d.data)?d.data:[]);
-    const rows=points.map(c=>({time:new Date(Number(c.t??c.time??c.timestamp)*(Number(c.t??c.time??c.timestamp)<1e12?1000:1)),open:Number(c.o??c.open),high:Number(c.h??c.high),low:Number(c.l??c.low),close:Number(c.c??c.close),volume:Number(c.v??c.volume)||0})).filter(c=>[c.open,c.high,c.low,c.close].every(v=>Number.isFinite(v)&&v>0)&&c.high>=Math.max(c.open,c.close)&&c.low<=Math.min(c.open,c.close)).sort((a,b)=>a.time-b.time);
-    if(rows.length>=60){const age=Date.now()-rows.at(-1).time.getTime();if(age>20*60*1000)throw new Error('XAUS OHLC is stale ('+Math.round(age/60000)+' minutes old)');pmDataSource='XAUS XAU/USD OHLC';return {rows,meta:{regularMarketPrice:rows.at(-1).close},symbol:'XAU/USD'};}
-    throw new Error('XAUS chart returned fewer than 60 valid candles ('+rows.length+')');
-  }catch(e){lastErr=(e?.message||String(e))+' [XAUS OHLC]';}
-  // Public OHLC fallback cascade. CORS relays are best-effort, never trusted blindly.
-  const symbols=[{symbol:'XAUUSD=X',label:'Yahoo XAU/USD reference'},{symbol:'GC=F',label:'Yahoo gold futures reference'}];
-  for(const item of symbols){
-    const upstream=`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(item.symbol)}?range=5d&interval=5m`;
-    const routes=[
-      {url:upstream,label:'direct'},
-      {url:`https://api.allorigins.win/raw?url=${encodeURIComponent(upstream)}`,label:'AllOrigins relay'},
-      {url:`https://corsproxy.io/?url=${encodeURIComponent(upstream)}`,label:'CORSProxy relay'},
-      {url:`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(upstream)}`,label:'CodeTabs relay'},
-      {url:`https://proxy.cors.sh/${upstream}`,label:'CORS.sh relay'}
-    ];
-    for(const route of routes){try{
-      const d=await getJSON(route.url,9000),r=d?.chart?.result?.[0];if(!r)throw new Error(d?.chart?.error?.description||'No chart result');
-      const q=r.indicators?.quote?.[0],ts=r.timestamp||[];if(!q?.close)throw new Error('No OHLC data');
-      const rows=ts.map((t,i)=>({time:new Date(t*1000),open:Number(q.open?.[i]),high:Number(q.high?.[i]),low:Number(q.low?.[i]),close:Number(q.close?.[i]),volume:q.volume?.[i]??null})).filter(c=>[c.open,c.high,c.low,c.close].every(v=>Number.isFinite(v)&&v>0)&&c.high>=Math.max(c.open,c.close)&&c.low<=Math.min(c.open,c.close));
-      if(rows.length<60)throw new Error('Insufficient valid candles: '+rows.length);
-      const age=Date.now()-rows.at(-1).time.getTime();if(age>20*60*1000)throw new Error('Latest candle is stale ('+Math.round(age/60000)+' minutes old)');
-      pmDataSource=item.label+' via '+route.label;
-      return {rows,meta:r.meta||{},symbol:item.symbol};
-    }catch(e){lastErr=(e?.message||String(e))+' ['+item.label+' / '+route.label+']';}}
-  }
-  throw new Error(lastErr+'; public feeds may be blocked by browser CORS/network or market closure. No candles were fabricated.');
+$('csvFile').addEventListener('change',async e=>{const f=e.target.files[0];if(!f)return;try{candles=parseCSV(await f.text());quote=null;renderCandles();analyze();$('importStatus').textContent=`Loaded ${candles.length} valid candles from ${f.name}. Dataset is user-supplied; not verified live.`;}catch(err){$('importStatus').textContent=err.message;}});
+$('loadSample').addEventListener('click',()=>{candles=[];let p=4000;for(let i=0;i<160;i++){let drift=(i>110?.8:-.1)+(Math.sin(i/6)*.8),o=p,c=o+drift+(Math.random()-.5)*1.2,h=Math.max(o,c)+Math.random()*1.2,l=Math.min(o,c)-Math.random()*1.2;p=c;candles.push({time:`DEMO-${String(i+1).padStart(3,'0')}`,open:+o.toFixed(2),high:+h.toFixed(2),low:+l.toFixed(2),close:+c.toFixed(2),volume:0});}quote=null;renderCandles();analyze();$('importStatus').textContent='DEMO DATA ONLY — synthetic candles, not market prices. Do not trade from this dataset.';});
+$('clearCandles').addEventListener('click',()=>{candles=[];quote=null;renderCandles();analyze();$('importStatus').textContent='Candle data cleared.';});
+$('saveQuote').addEventListener('click',()=>{const price=num('manualPrice',NaN),time=$('manualTime').value;if(!(price>0)){alert('Enter a valid positive quote.');return;}quote={price,time:time||'timestamp not supplied'};$('dataStatus').textContent='MANUAL QUOTE · UNVERIFIED';$('updatedAt').textContent='User entered';$('statusDot').style.background='var(--gold)';analyze();});
+$('reanalyze').addEventListener('click',analyze);
+function calculateRisk(){
+ const balance=num('balance'),equity=num('equity'),rp=num('riskPct'),target=num('target'),dl=num('dailyLoss'),pl=num('dayPL'),dd=num('maxDD'),pos=num('positions'),maxPos=num('maxPositions'),tr=num('tradesToday'),maxTr=num('maxTrades'),maxL=num('maxLosses'),losses=num('lossesNow'),stopT=$('stopThreshold').value.trim()===''?NaN:num('stopThreshold');
+ const risk=equity*rp/100, draw=balance>0?Math.max(0,(balance-equity)/balance*100):NaN, remaining=Math.max(0,dl+Math.min(0,pl)), targetRem=Math.max(0,target-pl);
+ $('riskMoney').textContent=money(risk);$('drawdown').textContent=Number.isFinite(draw)?`${draw.toFixed(2)}%`:'—';$('lossRemaining').textContent=money(remaining);$('targetRemaining').textContent=money(targetRem);
+ const warns=[];if(balance<=0||equity<=0)warns.push('Balance and equity must be positive.');if(rp<=0||rp>5)warns.push('Risk percentage must be above 0 and no more than 5% in this calculator.');if(draw>=dd&&dd>0)warns.push('Maximum drawdown limit reached or exceeded: stop trading and review.');if(pl<=-dl&&dl>0)warns.push('Daily maximum loss reached: stop trading for the day.');if(pos>=maxPos)warns.push('Maximum simultaneous positions reached.');if(tr>=maxTr)warns.push('Maximum trades per day reached.');if(losses>=maxL)warns.push('Maximum consecutive losses reached: stop and review.');if(Number.isFinite(stopT)&&Math.abs(Math.min(0,pl))>=stopT&&stopT>0)warns.push('Optional daily stop threshold reached.');if(target>balance)warns.push(`Target is ${(target/balance*100).toFixed(0)}% of starting balance. This is an extreme target, not a realistic or assured daily outcome.`);if(!warns.length)warns.push('No configured stop condition currently triggered. This is not a recommendation to trade.');
+ $('riskWarnings').innerHTML=warns.map(w=>`<div class="warning ${w.startsWith('No configured')?'success':''}">${esc(w)}</div>`).join('');
 }
-function aggregateBars(rows,minutes){const out=[];let bucket=null;for(const c of rows){const k=Math.floor(c.time.getTime()/(minutes*60000));if(!bucket||bucket.k!==k){bucket={k,time:c.time,open:c.open,high:c.high,low:c.low,close:c.close,volume:c.volume??0,count:1};out.push(bucket);}else{bucket.high=Math.max(bucket.high,c.high);bucket.low=Math.min(bucket.low,c.low);bucket.close=c.close;bucket.volume+=c.volume??0;bucket.count++;}}return out;}
-function atrValue(rows,n=14){if(rows.length<n+1)return NaN;const tr=[];for(let i=1;i<rows.length;i++)tr.push(Math.max(rows[i].high-rows[i].low,Math.abs(rows[i].high-rows[i-1].close),Math.abs(rows[i].low-rows[i-1].close)));return tr.slice(-n).reduce((a,b)=>a+b,0)/Math.min(n,tr.length);}
-function emaClose(rows,n){if(rows.length<n)return NaN;let e=rows.slice(0,n).reduce((a,c)=>a+c.close,0)/n;const k=2/(n+1);for(let i=n;i<rows.length;i++)e=rows[i].close*k+e*(1-k);return e;}
-function pmAnalyse(rows,source){
-  const m5=rows,m15=aggregateBars(rows,15),h1=aggregateBars(rows,60),h4=aggregateBars(rows,240);if(m5.length<40||m15.length<20||h1.length<10||h4.length<4)throw new Error('Not enough candles for multi-timeframe context');
-  const last=m5.at(-1),prev=m5.at(-2),recent=m5.slice(-12,-1),priorLow=Math.min(...recent.map(c=>c.low)),priorHigh=Math.max(...recent.map(c=>c.high));
-  const sweepDown=last.low<priorLow&&last.close>priorLow,sweepUp=last.high>priorHigh&&last.close<priorHigh;
-  const bull=last.close>last.open&&last.close>prev.high,bear=last.close<last.open&&last.close<prev.low;
-  const trend=(bars)=>emaClose(bars,8)>emaClose(bars,21)?1:emaClose(bars,8)<emaClose(bars,21)?-1:0;
-  const t4=trend(h4),t1=trend(h1),t15=trend(m15),t5=trend(m5),atr=atrValue(m5,14);if(!Number.isFinite(atr)||atr<=0)throw new Error('ATR unavailable');
-  let side=0,score=0,why=[];
-  if(t4&&t4===t1){score+=2;why.push('H4/H1 EMA structure aligned '+(t4>0?'bullish':'bearish'));}
-  if(t15===t1){score+=1;why.push('M15 agrees with H1');}
-  if(sweepDown&&bull){side=1;score+=3;why.push('M5 sell-side liquidity sweep and bullish displacement');}
-  if(sweepUp&&bear){side=-1;score+=3;why.push('M5 buy-side liquidity sweep and bearish displacement');}
-  if(side&&t5===side){score+=1;why.push('M5 momentum confirms');}
-  if(side&&t4&&t4!==side){score-=2;why.push('Countertrend penalty against H4');}
-  const minScore=Number(pm.minRR)>=2?5:4;
-  if(!side||score<minScore){setText('pmScanStatus',`LIVE CANDLES RECEIVED · ${source}. ${m5.length} M5 candles; H4/H1/M15/M5 evaluated. No setup meets the sweep + displacement + confluence threshold (score ${score}). Waiting; no trade.`);setText('pmEngineStatus','LIVE REFERENCE CANDLES · NO SETUP');return;}
-  if((pm.direction==='buy'&&side<0)||(pm.direction==='sell'&&side>0)){setText('pmScanStatus','Live candles scanned; setup direction blocked by your Profit Manager direction filter.');return;}
-  const dailyLossCap=Math.max(0,pm.equity)*(Number(pm.maxLoss)||3)/100;const remainingLoss=dailyLossCap-Math.max(0,-(Number(pm.realised)||0))-Math.max(0,Number(pm.openRisk)||0);if((Number(pm.realised)||0)>=Number(pm.target||Infinity)){setText('pmScanStatus','Daily profit target reached. No new signal will be issued for the rest of this SAST day.');setText('pmEngineStatus','DAILY TARGET REACHED · PAUSED');return;}if(remainingLoss<=0){setText('pmScanStatus','DAILY LOSS / OPEN-RISK CAP USED. New signals are blocked by the Profit Manager guardrail.');setText('pmEngineStatus','RISK LIMIT REACHED · PAUSED');return;}const entry=last.close,stop=side>0?Math.min(last.low,entry-atr*1.25):Math.max(last.high,entry+atr*1.25),riskDist=Math.abs(entry-stop),rr=Math.max(1,Number(pm.minRR)||2),target=entry+side*riskDist*rr;
-  const key=`${side}:${Math.floor(last.time.getTime()/300000)}:${entry.toFixed(2)}`;if(pm.signals.some(s=>s.id===key)){setText('pmScanStatus','Live scan complete; current candle signal already logged. '+source);return;}
-  const sig={id:key,dayKey:pmDayKey(),time:new Date().toLocaleString('en-ZA'),type:'Liquidity sweep + multi-timeframe confluence',side:side>0?'BUY':'SELL',entry,stop,target,status:'NEW SIGNAL',lifecycle:[{status:'NEW SIGNAL',time:new Date().toLocaleString('en-ZA'),note:'Signal flashed and logged; awaiting Take or Skip.'}],summary:`${why.join('; ')}. Score ${score}. ATR(14)=${atr.toFixed(2)}; planned R:R ${rr.toFixed(1)}:1. Source: ${source}. Reference/futures candles, not broker bid/ask; volume is exchange-reported proxy where available. Order flow, macro and DXY/yields are not connected, so this is a rules-based candidate, not a verified institutional-flow signal.`};
-  pm.signals.push(sig);if(pm.signals.length>100)pm.signals=pm.signals.slice(-100);localStorage.setItem(PMKEY,JSON.stringify(pm));setText('pmScanStatus',`NEW ${sig.side} CANDIDATE · ${source}. Score ${score}; Entry ${entry.toFixed(2)}, SL ${stop.toFixed(2)}, TP ${target.toFixed(2)}. Verify against broker quote and spread before any trade.`);setText('pmEngineStatus','LIVE REFERENCE CANDLES · CANDIDATE FOUND');pmRender();
+$('calcRisk').addEventListener('click',calculateRisk);
+$('calcPosition').addEventListener('click',()=>{
+ const entry=num('entry',NaN),stop=num('stop',NaN),tp1=num('tp1',NaN),tp2=num('tp2',NaN),v=num('moveValue',NaN),step=num('lotStep',.01),risk=num('equity')*num('riskPct')/100;
+ if(!(entry>0&&stop>0&&v>0&&step>0)||entry===stop){$('positionResult').textContent='Enter positive entry and stop prices, a non-zero stop distance, verified value-per-$1-per-lot and valid lot step.';return;}
+ const distance=Math.abs(entry-stop),raw=risk/(distance*v),lots=Math.floor(raw/step)*step,loss=lots*distance*v;
+ const profit=t=>Number.isFinite(t)&&t>0?Math.abs(t-entry)*v*lots:NaN;
+ $('positionResult').innerHTML=`<div class="metric-list"><div><span>Risk budget</span><b>${money(risk)}</b></div><div><span>Stop distance</span><b>${fmt(distance)} price units</b></div><div><span>Estimated lot size (rounded down)</span><b>${lots.toFixed(3)}</b></div><div><span>Potential stop loss, before costs</span><b>${money(loss)}</b></div><div><span>Potential target 1 profit</span><b>${money(profit(tp1))}</b></div><div><span>Potential target 2 profit</span><b>${money(profit(tp2))}</b></div><div><span>R:R to target 1</span><b>${Number.isFinite(tp1)?(Math.abs(tp1-entry)/distance).toFixed(2)+':1':'—'}</b></div></div><p class="note">Verify volume min/max, tick value, contract size and conversion with your broker. This estimate excludes commission, spread, swaps and slippage.</p>`;
+});
+function runBacktest(){
+ const n=candles.length;if(n<100){$('backtestResults').textContent='Need at least 100 valid candles. Import history first; demo data is synthetic and unsuitable for judging a real strategy.';return;}
+ const frac=Math.min(90,Math.max(10,num('testFraction',30)))/100,split=Math.floor(n*(1-frac)),commission=num('commission'),slip=num('slippage'),start=num('btBalance',10000);
+ let equity=start,peak=start,maxDD=0,trades=[],lossStreak=0,maxStreak=0;
+ for(let i=Math.max(22,split);i<n-1;i++){
+  const hist=candles.slice(i-20,i),cur=candles[i],a=atrCalc(candles.slice(Math.max(0,i-15),i+1));
+  const hh=Math.max(...hist.map(c=>c.high)),ll=Math.min(...hist.map(c=>c.low));
+  let dir=cur.close>hh?'BUY':cur.close<ll?'SELL':null;if(!dir||!Number.isFinite(a)||a<=0)continue;
+  const entry=candles[i+1].open+(dir==='BUY'?slip:-slip),stop=entry+(dir==='BUY'?-1:1)*a*1.5,target=entry+(dir==='BUY'?1:-1)*a*2.5;
+  let exit=candles[i+1].close,why='end';for(let j=i+1;j<Math.min(n,i+13);j++){const c=candles[j];if(dir==='BUY'&&c.low<=stop){exit=stop;why='stop';break;}if(dir==='SELL'&&c.high>=stop){exit=stop;why='stop';break;}if(dir==='BUY'&&c.high>=target){exit=target;why='target';break;}if(dir==='SELL'&&c.low<=target){exit=target;why='target';break;}exit=c.close;}
+  const pnl=(dir==='BUY'?exit-entry:entry-exit)-commission;equity+=pnl;peak=Math.max(peak,equity);maxDD=Math.max(maxDD,(peak-equity)/peak*100);trades.push({pnl,why});if(pnl<0){lossStreak++;maxStreak=Math.max(maxStreak,lossStreak);}else lossStreak=0;
+ }
+ if(!trades.length){$('backtestResults').textContent='No trades triggered in the out-of-sample portion.';return;}
+ const wins=trades.filter(t=>t.pnl>0),losses=trades.filter(t=>t.pnl<0),grossWin=wins.reduce((s,t)=>s+t.pnl,0),grossLoss=Math.abs(losses.reduce((s,t)=>s+t.pnl,0)),net=trades.reduce((s,t)=>s+t.pnl,0);
+ $('backtestResults').innerHTML=`<div class="kpi-grid"><div class="kpi"><span>Out-of-sample trades</span><b>${trades.length}</b></div><div class="kpi"><span>Win rate</span><b>${(wins.length/trades.length*100).toFixed(1)}%</b></div><div class="kpi"><span>Net P/L (1-unit size proxy)</span><b>${fmt(net)}</b></div><div class="kpi"><span>Profit factor</span><b>${grossLoss?fmt(grossWin/grossLoss):'∞ / no losses'}</b></div><div class="kpi"><span>Maximum drawdown</span><b>${maxDD.toFixed(2)}%</b></div><div class="kpi"><span>Max consecutive losses</span><b>${maxStreak}</b></div><div class="kpi"><span>Expectancy / trade</span><b>${fmt(net/trades.length)}</b></div><div class="kpi"><span>Average win / loss</span><b>${fmt(wins.length?grossWin/wins.length:0)} / ${fmt(losses.length?grossLoss/losses.length:0)}</b></div></div><p class="note">Chronological out-of-sample segment begins at candle ${split+1}/${n}. Approximate OHLC fills; stop/target order within a candle is ambiguous. Costs are simplified; sizing is a 1-unit price-change proxy, not a broker lot simulation.</p>`;
 }
-async function pmRescan(){if(pmScanBusy)return;pmScanBusy=true;setText('pmScanStatus','Connecting to public gold OHLC feed and evaluating H4/H1/M15/M5…');setText('pmEngineStatus','CONNECTING TO LIVE REFERENCE DATA');try{const d=await fetchGoldCandles();pmCandles=d.rows;pmLastScan=Date.now();if(d.meta?.regularMarketPrice&&Number.isFinite(Number(d.meta.regularMarketPrice))){const p=Number(d.meta.regularMarketPrice);setText('pmScanStatus',`Feed connected: ${pmDataSource}; latest candle ${d.rows.at(-1).time.toLocaleString('en-ZA')}; reference last ${p.toFixed(2)} USD. Scanning structure…`);}pmAnalyse(d.rows,pmDataSource);}catch(e){setText('pmEngineStatus','LIVE CANDLE FEED UNAVAILABLE');setText('pmScanStatus','Candle connection failed: '+(e.message||e)+'. Quote polling may still work, but no candle-based signal is generated. Retry scan or use a licensed provider/broker feed.');}finally{pmScanBusy=false;}}
-
-function pmExport(){const rows=[['time','type','side','entry','stop','target','status','outcome','summary'],...pm.signals.map(s=>[s.time,s.type,s.side,s.entry??'',s.stop??'',s.target??'',s.status,s.outcome||'',s.summary||''])];const csv=rows.map(r=>r.map(v=>'"'+String(v).replace(/"/g,'""')+'"').join(',')).join('\n');const url=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));const a=document.createElement('a');a.href=url;a.download='goldflow-profit-manager-signals.csv';a.click();URL.revokeObjectURL(url);}
-function pmInit(){pmLoad();pmFields();pmRender();$('pmSave').addEventListener('click',pmSave);$('pmUpdatePnL').addEventListener('click',()=>{const pnl=Number($('pmRealised').value),risk=Number($('pmOpenRisk').value);if(!Number.isFinite(pnl)||!Number.isFinite(risk)||risk<0){alert('Enter a valid realised P/L and open risk (zero or greater).');return;}pm.realised=pnl;pm.openRisk=risk;pmRollDay();pmPersist();pmRender();});$('pmRescan').addEventListener('click',pmRescan);$('pmExport').addEventListener('click',pmExport);}
-
-function bind(){document.querySelectorAll('.nav-item').forEach(b=>b.addEventListener('click',()=>showTab(b.dataset.tab)));$('refreshBtn').addEventListener('click',refreshQuote);$('refreshMarket').addEventListener('click',refreshQuote);$('saveAccount').addEventListener('click',saveAccount);$('calculateTrade').addEventListener('click',()=>calcPlan(true));['entry','stop','target','direction','contractSize','tickValue','tickSize'].forEach(id=>$(id).addEventListener('change',()=>calcPlan(false)));['ctxH4','ctxPD','ctxSweep','ctxM5','ctxNews'].forEach(id=>$(id).addEventListener('change',updateStructure));document.querySelectorAll('[data-check]').forEach(e=>e.addEventListener('change',()=>{cfg.checklist[e.dataset.check]=e.checked;save();}));$('updateRisk').addEventListener('click',updateRisk);$('csvFile').addEventListener('change',e=>{if(e.target.files[0])loadCSV(e.target.files[0]);});$('runBacktest').addEventListener('click',runBacktest);$('saveDataSettings').addEventListener('click',()=>{cfg.dataUrl=$('dataUrl').value.trim();cfg.refreshSeconds=Math.max(5,Math.min(60,Number($('refreshSeconds').value)||15));save();startPolling();refreshQuote();});$('saveInstrument').addEventListener('click',()=>{cfg.currency=$('accountCurrency').value;cfg.currencySymbol=cfg.currency==='ZAR'?'R':cfg.currency;cfg.broker=$('brokerName').value.trim();cfg.contractSize=Math.max(.000001,num('defaultContract')||100);cfg.tickSize=Math.max(.000001,num('defaultTick')||.01);$('contractSize').value=cfg.contractSize;$('tickSize').value=cfg.tickSize;save();updateAccount();alert('Instrument settings saved locally. Verify all specifications with your broker.');});$('resetApp').addEventListener('click',()=>{if(confirm('Reset all locally saved GoldFlow settings?')){localStorage.removeItem(STORE);location.reload();}});$('copyPlan').addEventListener('click',async()=>{if(!lastPlan){alert('Calculate a valid plan first.');return;}const p=lastPlan;const s=['GOLDFLOW AI — TRADE PLAN',p.dir.toUpperCase()+' XAUUSD','Entry: '+p.entry,'Stop: '+p.stop,'Target: '+p.target,'Stop distance: '+p.stopDist.toFixed(2),'Reward:risk: '+p.rr.toFixed(2)+':1','Risk budget: '+fmt(p.risk),'Estimated size: '+(Number.isFinite(p.lots)?p.lots.toFixed(4)+' lots':'unavailable'),'Estimated profit: '+fmt(p.profit),'Verify broker tick value, lot step, spread, fees and margin. No guarantee.'].join('\n');try{await navigator.clipboard.writeText(s);alert('Plan copied.');}catch(e){prompt('Copy plan summary:',s);}});}
-function startPolling(){if(timer)clearInterval(timer);timer=setInterval(refreshQuote,Math.max(5,Number(cfg.refreshSeconds)||15)*1000);}
-function init(){load();initFields();updateAccount();bind();pmInit();clock();setInterval(clock,1000);updateStructure();updateRisk();refreshQuote();startPolling();setTimeout(pmRescan,1800);setInterval(()=>{if(document.visibilityState==='visible')pmRescan();},60000);if('serviceWorker'in navigator&&location.protocol.startsWith('http'))navigator.serviceWorker.register('./sw.js').catch(()=>{});}
-document.addEventListener('DOMContentLoaded',init);
+$('runBacktest').addEventListener('click',runBacktest);
+function savePrefs(){const ids=['balance','equity','currency','riskPct','target','dailyLoss','dayPL','maxDD','positions','maxPositions','tradesToday','maxTrades','riskRR','maxLosses','lossesNow','stopThreshold','minRR','atrMult'];const o={};ids.forEach(id=>o[id]=$(id).value);if($('savePrefs').checked)localStorage.setItem('goldflow-prefs',JSON.stringify(o));$('settingsStatus').textContent=$('savePrefs').checked?'Settings saved on this device.':'Preference saving disabled.';}
+$('saveSettings').addEventListener('click',()=>{savePrefs();calculateRisk();});
+$('resetSettings').addEventListener('click',()=>{localStorage.removeItem('goldflow-prefs');$('settingsStatus').textContent='Saved preferences removed. Refresh to use defaults.';});
+try{const saved=JSON.parse(localStorage.getItem('goldflow-prefs')||'{}');Object.entries(saved).forEach(([id,val])=>{if($(id))$(id).value=val;});}catch(_){}
+$('exportData').addEventListener('click',()=>{if(!candles.length){$('settingsStatus').textContent='No candles to export.';return;}const csv='time,open,high,low,close,volume\n'+candles.map(c=>[c.time,c.open,c.high,c.low,c.close,c.volume].join(',')).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download='goldflow-candles.csv';a.click();URL.revokeObjectURL(a.href);});
+$('updatedAt').textContent='No feed connected';calculateRisk();analyze();
 })();

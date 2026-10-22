@@ -1,51 +1,43 @@
-# GoldFlow AI Elite — rebuilt project
+# GoldFlow AI Elite — The Fundamental Edge
 
-A static trading workspace designed for GitHub Pages. The project includes a functional local Profit Manager tracker, market quote display, multi-timeframe rule-based signal scanner, trade planner, risk desk, CSV candle backtester, signal lifecycle log, export, and embedded TradingView chart.
+A static, mobile-first XAUUSD analysis and risk-planning PWA intended for GitHub Pages.
 
-## Quick deploy (GitHub Pages)
+## Included working features
+- Responsive dashboard and navigation.
+- CSV OHLC candle import, validation, and recent-candle table.
+- Candle-derived range break/sweep heuristics, ATR proxy, and candidate trade plan.
+- Equity and risk calculator with configurable daily limits, drawdown warnings, and ZAR/USD/EUR/GBP display.
+- Position-size estimate only when the user supplies broker-verified value-per-$1-per-lot and stop distance.
+- Simple chronological candle-based backtest with basic metrics and explicit limitations.
+- Local preference storage, CSV export, manifest, app icons, and service-worker shell caching.
 
-1. Create a new public GitHub repository.
-2. Upload the **contents of this ZIP directly into the repository root** (so `index.html` is at the root, not nested inside another folder).
-3. Commit to `main`.
-4. Open **Settings → Pages** and select **Deploy from a branch → `main` → `/ (root)`**.
-5. Open the published site, enter the Profit Manager tab, set equity/target/direction/risk limits, and press **Save & start monitoring**. The target tracker and signal journal save in that browser using local storage.
+## Important limitations
+- There is **no connected live price feed**, broker connection, genuine bid/ask aggressor classification, CVD, footprint, DOM, COMEX feed, or economic calendar.
+- Manual quote and imported candles are user-supplied, not independently verified. Synthetic demo candles are labelled and must not be used for trading.
+- Scores are rule scores, not probabilities of winning. No profitability is claimed.
+- Static GitHub Pages cannot safely store API secrets or run a private backend. For genuine data, add a provider adapter and secure backend separately; never place API secrets in this repository.
+- The backtest is an approximate candle-based test, not order-flow validation. OHLC data cannot resolve the order of stop/target hits within the same candle.
 
-## Live market data: what this build does
+## Publish from iPhone
+1. Open the repository `https://github.com/kay222213/goldflow-ai` in Safari.
+2. Add/upload the extracted ZIP contents to the repository root (the `index.html`, `styles.css`, `app.js`, `manifest.webmanifest`, `sw.js`, `README.md`, and `icons/` folder). Do **not** upload the ZIP itself.
+3. Commit the files to the branch/folder configured for GitHub Pages.
+4. Open `https://kay222213.github.io/goldflow-ai/` in Safari. If old content persists, wait for Pages to deploy, close the tab, reopen it, and refresh. The service worker updates the app shell, but a stale iOS home-screen install may need to be removed and re-added.
+5. In Safari, tap Share → Add to Home Screen.
 
-- **Quote cascade:** tries the XAUS XAU/USD spot endpoint first, then Gold-API, Metals.live, and Yahoo reference sources. XAUS has an open browser CORS policy and its documented spot response uses `spot_usd_oz` / `updated_at`; the parser in this build handles those fields and checks freshness.
-- **Candles for scanning:** tries XAUS's `/api/v1/chart?symbol=xau&range=5d&interval=5m` OHLC endpoint first, then a Yahoo Finance XAU/USD reference series and public CORS relays. It validates OHLC bars and rejects stale/insufficient data rather than inventing candles.
-- **Refresh:** quote polling is configurable in Settings & data. The scanner rechecks while the page is open. Browser sleep, network policy, source outages, CORS, market closure, and provider throttling can still interrupt a feed. If the status says unavailable/stale, treat it as unavailable/stale; do not trade from stale data.
-- **TradingView is separate:** the embedded chart is rendered by TradingView and is not a data API that the app can read. The scanner uses its own quote/candle sources.
-- **Reference feed is not broker execution data:** it does not equal your active MT5 broker's bid/ask, spread, contract specification, or fill price. This project does not connect to MT5 and does not place, manage, or close broker orders.
+## CSV format
+Required header names: `open,high,low,close`. Optional: `time` (or `timestamp`/`datetime`/`date`) and `volume`. One row per candle; use chronological order. The app rejects invalid OHLC rows.
 
-## Profit Manager behaviour
+## Testing checklist
+- [ ] Open `index.html` through GitHub Pages (not a local `file://` URL).
+- [ ] Switch between all four tabs.
+- [ ] Import a known CSV and confirm candle count and last close.
+- [ ] Test malformed CSV and confirm a readable error.
+- [ ] Set balance 1000 and target 2000; risk panel should warn that target is 200% of balance.
+- [ ] Position planner should refuse sizing until a broker-verified value-per-$1-move is entered.
+- [ ] Run backtest with at least 100 candles and inspect limitations.
+- [ ] Verify offline app shell only; never interpret cached candles or quotes as live.
+- [ ] Add to iPhone home screen.
 
-- Saves equity, daily profit target, allowed direction (BUY/SELL/BOTH), risk percentage, daily loss cap, and minimum reward:risk.
-- Calculates profit still needed, target return versus the entered equity, per-trade risk budget, progress bar, and an estimated equity after realised P/L.
-- Tracks manually entered realised P/L and open risk; closing a tracked signal can add its entered realised result to the daily total.
-- Stores signal history and lifecycle (NEW SIGNAL → TAKE/SKIP → HOLD/CLOSE), allows signal details to expand, and exports the log to CSV.
-- Rolls the realised-P/L counter at the new day in South African time while retaining signal history.
-- Blocks new signals after the target is reached or the daily loss/open-risk budget is used. Prevents taking another tracked signal while a prior signal is still marked TAKEN/HOLD. These are local UI guardrails; they cannot block a trade entered independently in MT5.
-- It never promises a daily profit or guarantees a correct trade. A rules-based signal is a candidate, not an instruction.
-
-## Optional authenticated data proxy
-
-For a more controlled candle source, the `cloudflare-worker/worker.js` file can be deployed as a Cloudflare Worker with a provider API key stored as a Worker Secret named `TWELVE_DATA_API_KEY`. Never put a provider key in this public repository. Configure the deployed Worker base URL in **Settings & data**. The exact provider symbol/plan entitlement and request quotas must be verified with the provider.
-
-## Known constraints (important)
-
-- No browser-only app can guarantee uninterrupted live data from third-party providers. The included public providers are best-effort and may be delayed, rate-limited, or unavailable.
-- A TradingView embed does not expose its candles to this application.
-- Public spot data is indicative, not a broker executable quote; third-party candles may differ from the active broker.
-- The app does not receive DXY, Treasury yields, a news calendar, true order-flow/volume-delta, MT5 account equity, floating P/L, or open positions automatically. Those are not fabricated.
-- The app does not execute trades. Verify every setup, lot size, tick value, spread, margin, and risk calculation in your broker terminal.
-
-## Files
-
-- `index.html` — all app tabs and layout
-- `app.js` — quote/candle data, target tracker, risk and signal logic
-- `styles.css` — responsive black-and-gold UI
-- `cloudflare-worker/worker.js` — optional secure API proxy
-- `assets/` — branding assets
-- `sw.js` — service worker cache (versioned for this build)
-- `tests/smoke-test.js` — static integrity smoke tests
+## Data-source architecture
+This build is provider-independent and intentionally uses file/manual inputs only. For spot XAUUSD, broker quote/tick feeds represent that broker's OTC pricing, not the entire global market. COMEX GC/MGC trades and order book are exchange-specific futures data and differ from spot by basis, contract and expiry effects. Genuine aggressor-side delta/CVD requires classified trade data; candle volume cannot supply it. A secure backend may be required for protected provider credentials or streaming integrations.
